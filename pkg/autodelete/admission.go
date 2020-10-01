@@ -1,20 +1,25 @@
 package autodelete
 
 import (
-	"fmt"
+	"encoding/json"
 	admissioncontrol "github.com/elithrar/admission-control"
 	admission "k8s.io/api/admission/v1beta1"
+	v12 "k8s.io/api/batch/v1"
 	"k8s.io/api/batch/v1beta1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	"net/http"
+	"os"
 	"strings"
 )
 
 const (
 	AutoDeleteAnnotation = "auto-delete-admission"
+	ContainerImage       = "busybox:latest"
 )
 
 func AutoDelete(ignoredNamespaces []string) admissioncontrol.AdmitFunc {
@@ -29,18 +34,51 @@ func AutoDelete(ignoredNamespaces []string) admissioncontrol.AdmitFunc {
 			return newDefaultSuccessResponse(admissionReview.Request.UID), nil
 		}
 		value := unstructureds.GetAnnotations()[AutoDeleteAnnotation]
-		fmt.Println(value)
-		createCronJob(unstructureds.GetGenerateName(), value)
+		job := createCronJob(unstructureds.GetGenerateName(), parseScheduleValue(value), unstructureds.GetName()+unstructureds.GetKind())
 
+		patchOperationsBytes, err := json.Marshal(job)
+
+		if err != nil {
+			resp.Result.Code = http.StatusInternalServerError
+			resp.Allowed = false
+			return resp, err
+		}
 		resp.Allowed = true
+		resp.Patch = patchOperationsBytes
 		return resp, nil
 	}
 }
 
-func createCronJob(name string, value string) *v1beta1.CronJob {
+func parseScheduleValue(value string) string {
+	//TODO
+	return value
+}
+
+func createCronJob(name string, schedule string, resource string) *v1beta1.CronJob {
 	cronJob := new(v1beta1.CronJob)
 	cronJob.ObjectMeta = *createObjectMeta(name)
+	cronJob.Spec = *createSpec(resource, schedule)
 	return cronJob
+}
+
+func createSpec(resource string, schedule string) *v1beta1.CronJobSpec {
+	spec := new(v1beta1.CronJobSpec)
+	spec.Schedule = schedule
+	spec.JobTemplate = *createJobTemplate(resource)
+
+	return spec
+}
+
+func createJobTemplate(resource string) *v1beta1.JobTemplateSpec {
+	jobTemplateSpec := new(v1beta1.JobTemplateSpec)
+	jobTemplateSpec.Spec = *createJobSpec(resource)
+	return jobTemplateSpec
+}
+
+func createJobSpec(resource string) *v12.JobSpec {
+	jobSpec := new(v12.JobSpec)
+	jobSpec.Template = *createPodTemplateSpec(resource)
+	return jobSpec
 }
 
 func newDefaultDenyResponse() *admission.AdmissionResponse {
@@ -90,9 +128,35 @@ func ensureHasAnnotationKey(required string, annotations map[string]string) bool
 func createObjectMeta(name string) *metav1.ObjectMeta {
 	objectMeta := new(metav1.ObjectMeta)
 	objectMeta.Name = strings.ToLower(name)
+	objectMeta.Namespace = os.Getenv("NAMESPACE")
 	objectMeta.Labels = map[string]string{
-		"app":  strings.ToLower(name),
-		"type": "user-app",
+		"admission-controller-name": strings.ToLower(name),
+		"type":                      "auto-delete-cronjob",
 	}
 	return objectMeta
+}
+
+func createPodTemplateSpec(resource string) *v1.PodTemplateSpec {
+	podTemplateSpec := new(v1.PodTemplateSpec)
+	podTemplateSpecObjectMeta := new(metav1.ObjectMeta)
+	podTemplateSpec.ObjectMeta = *podTemplateSpecObjectMeta
+	podSpec := createPodSpec(resource)
+	podTemplateSpec.Spec = *podSpec
+	return podTemplateSpec
+}
+
+func createPodSpec(resource string) *v1.PodSpec {
+	container := createContainer(resource)
+	podSpec := new(v1.PodSpec)
+	podSpec.Containers = []v1.Container{*container}
+	return podSpec
+}
+
+func createContainer(resourceName string) *v1.Container {
+	container := new(v1.Container)
+	container.Name = "auto-delete"
+	container.Image = ContainerImage
+	container.Command = []string{"curl", "$service", resourceName}
+	container.ImagePullPolicy = v1.PullIfNotPresent
+	return container
 }
